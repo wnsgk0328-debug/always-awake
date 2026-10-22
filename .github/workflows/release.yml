@@ -1,0 +1,25 @@
+name: Build and release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag and package
+        shell: pwsh
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag and version.txt must match' }
+          .\Package.ps1
+      - name: Publish release assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = (Get-Content version.txt -Raw).Trim()
+          $folder = "dist/v$version"
+          gh release create "v$version" "$folder/AlwaysAwake.exe" "$folder/AlwaysAwake-win-portable.zip" "$folder/SHA256SUMS.txt" --verify-tag --title "Always Awake $version" --notes-file CHANGELOG.md
