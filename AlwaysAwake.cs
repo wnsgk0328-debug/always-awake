@@ -16,6 +16,13 @@ static class Native {
     [DllImport("user32.dll")] internal static extern bool GetLastInputInfo(ref LASTINPUT info);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern bool DestroyIcon(IntPtr icon);
+    [DllImport("user32.dll")] static extern IntPtr OpenInputDesktop(uint flags,bool inherit,uint access);
+    [DllImport("user32.dll")] static extern bool CloseDesktop(IntPtr desktop);
+    internal static bool SessionLocked() {
+        IntPtr desktop=OpenInputDesktop(0,false,1);
+        if(desktop==IntPtr.Zero) return true;
+        CloseDesktop(desktop); return false;
+    }
     [StructLayout(LayoutKind.Sequential)] internal struct LASTINPUT { internal uint size, tick; }
     [StructLayout(LayoutKind.Sequential)] internal struct INPUT { internal uint type; internal UNION data; }
     [StructLayout(LayoutKind.Explicit)] internal struct UNION {
@@ -41,7 +48,42 @@ static class Native {
     }
 }
 
+sealed class AwakeSettings {
+    internal bool Enabled, Input=true, Display=true, Resume=true;
+    internal int Minutes;
+    internal long UntilUtc;
+    internal static AwakeSettings Load(string path) {
+        AwakeSettings s=new AwakeSettings();
+        try {
+            if(!File.Exists(path)) return s;
+            foreach(string line in File.ReadAllLines(path)) {
+                string[] pair=line.Split(new char[]{'='},2); if(pair.Length!=2) continue;
+                bool b; int n; long t;
+                switch(pair[0]) {
+                    case "enabled": if(bool.TryParse(pair[1],out b)) s.Enabled=b; break;
+                    case "input": if(bool.TryParse(pair[1],out b)) s.Input=b; break;
+                    case "display": if(bool.TryParse(pair[1],out b)) s.Display=b; break;
+                    case "resume": if(bool.TryParse(pair[1],out b)) s.Resume=b; break;
+                    case "minutes": if(int.TryParse(pair[1],out n) && Array.IndexOf(new int[]{0,10,15,25,30,60,120},n)>=0) s.Minutes=n; break;
+                    case "untilUtc": if(long.TryParse(pair[1],out t) && t>=0 && t<=DateTime.MaxValue.Ticks) s.UntilUtc=t; break;
+                }
+            }
+            // Missing or invalid finite deadlines must never become indefinite sessions.
+            if(s.Minutes!=0 && (s.UntilUtc==0 || s.UntilUtc<=DateTime.UtcNow.Ticks)) s.Enabled=false;
+            return s;
+        } catch { return new AwakeSettings(); }
+    }
+    internal void Save(string path) {
+        Directory.CreateDirectory(Path.GetDirectoryName(path));
+        string temp=path+".tmp";
+        File.WriteAllLines(temp,new string[]{"enabled="+Enabled,"minutes="+Minutes,"input="+Input,"display="+Display,"resume="+Resume,"untilUtc="+UntilUtc});
+        if(File.Exists(path)) File.Replace(temp,path,path+".bak"); else File.Move(temp,path);
+    }
+}
+
 sealed class TrayApp : ApplicationContext {
+    readonly AwakeSettings settings;
+    readonly string settingsPath;
     readonly Control dispatcher = new Control();
     readonly Icon onIcon=MakeIcon(Color.FromArgb(20,160,95));
     readonly Icon offIcon=MakeIcon(Color.FromArgb(110,115,125));
@@ -53,10 +95,12 @@ sealed class TrayApp : ApplicationContext {
     readonly ToolStripMenuItem toggleItem = new ToolStripMenuItem();
     readonly ToolStripMenuItem inputItem = new ToolStripMenuItem("30초마다 활동 입력 (F15)");
     readonly ToolStripMenuItem displayItem = new ToolStripMenuItem("화면도 켜 두기");
+    readonly ToolStripMenuItem resumeItem = new ToolStripMenuItem("잠금 해제 후 자동 재개");
+    readonly ToolStripMenuItem loginItem = new ToolStripMenuItem("Windows 로그인 시 자동 실행");
     readonly ToolStripMenuItem[] durationItems;
     readonly int[] choices = {10,15,25,30,60,120,0};
-    bool active, locked, disposed;
-    int minutes=25;
+    bool active, locked, suspended, desired, ready, disposed;
+    int minutes;
     long deadline, nextPulse;
     int pulses;
     internal bool Active { get { return active; } }
@@ -75,7 +119,10 @@ sealed class TrayApp : ApplicationContext {
             finally { Native.DestroyIcon(handle); }
         }
     }
-    internal TrayApp(bool start) {
+    internal TrayApp(bool start) : this(start,Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),"AlwaysAwake","settings.ini")) { }
+    internal TrayApp(bool start,string configPath) {
+        settingsPath=configPath; settings=AwakeSettings.Load(settingsPath); minutes=settings.Minutes;
+        locked=Native.SessionLocked();
         IntPtr dispatcherHandle=dispatcher.Handle;
         stateItem.Enabled=false;
         menu.Items.Add(stateItem);
@@ -87,22 +134,32 @@ sealed class TrayApp : ApplicationContext {
         for(int i=0;i<choices.Length;i++) {
             int chosen=choices[i];
             ToolStripMenuItem item=new ToolStripMenuItem(chosen==0 ? "종료할 때까지" : chosen+"분");
-            item.Click += delegate { minutes=chosen; if(active) deadline=chosen==0 ? long.MaxValue : clock.ElapsedMilliseconds+chosen*60000L; RefreshStatus(); };
+            item.Click += delegate { minutes=chosen; if(desired) deadline=chosen==0 ? long.MaxValue : clock.ElapsedMilliseconds+chosen*60000L; SaveSettings(); RefreshStatus(); };
             durationItems[i]=item; duration.DropDownItems.Add(item);
         }
         menu.Items.Add(duration);
-        inputItem.Checked=true; inputItem.CheckOnClick=true;
-        inputItem.CheckedChanged += delegate { nextPulse=clock.ElapsedMilliseconds+30000; RefreshStatus(); };
-        displayItem.Checked=true; displayItem.CheckOnClick=true;
-        displayItem.CheckedChanged += delegate { if(active && !Native.Power(true,displayItem.Checked)) Stop("전원 API 실패"); RefreshStatus(); };
+        inputItem.Checked=settings.Input; inputItem.CheckOnClick=true;
+        inputItem.CheckedChanged += delegate { nextPulse=clock.ElapsedMilliseconds+30000; SaveSettings(); RefreshStatus(); };
+        displayItem.Checked=settings.Display; displayItem.CheckOnClick=true;
+        displayItem.CheckedChanged += delegate { if(active && !Native.Power(true,displayItem.Checked)) Stop("전원 API 실패"); SaveSettings(); RefreshStatus(); };
         menu.Items.Add(inputItem); menu.Items.Add(displayItem);
+        resumeItem.Checked=settings.Resume; resumeItem.CheckOnClick=true;
+        resumeItem.CheckedChanged += delegate { SaveSettings(); };
+        loginItem.CheckOnClick=true;
+        using(RegistryKey key=Registry.CurrentUser.OpenSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")) loginItem.Checked=key!=null && key.GetValue("AlwaysAwake")!=null;
+        loginItem.CheckedChanged += delegate {
+            try { using(RegistryKey key=Registry.CurrentUser.CreateSubKey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")) {
+                if(loginItem.Checked) key.SetValue("AlwaysAwake","\""+Application.ExecutablePath+"\""); else key.DeleteValue("AlwaysAwake",false);
+            } } catch(Exception ex) { MessageBox.Show("자동 실행 설정을 바꾸지 못했습니다.\n"+ex.Message,"Always Awake"); }
+        };
+        menu.Items.Add(resumeItem); menu.Items.Add(loginItem);
         menu.Items.Add(new ToolStripSeparator());
         string version=System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(3);
         menu.Items.Add("업데이트 확인 · v"+version,null,delegate {
             try { Process.Start(new ProcessStartInfo("https://github.com/wnsgk0328-debug/always-awake/releases/latest") { UseShellExecute=true }); }
             catch(Exception) { MessageBox.Show("브라우저를 열 수 없습니다.\nhttps://github.com/wnsgk0328-debug/always-awake/releases/latest","Always Awake"); }
         });
-        menu.Items.Add("사용 안내",null,delegate { MessageBox.Show("Always Awake\n\n아이콘 왼쪽 클릭: 켜기 / 끄기\n오른쪽 클릭: 시간과 모드 선택\n기본: 25분, 30초마다 F15 키 뗌 입력\n입력 중에는 최근 5초 이내 활동이 있으면 건너뜁니다.\nPC 잠금 시 중지하며 자동으로 재개하지 않습니다.\n\nTeams 초록색 상태 유지는 보장하지 않습니다.\nF15 단축키를 쓰는 앱에서는 활동 입력을 끄세요.\n전원 유지 모드만으로 Teams 유휴 상태가 해제되지는 않습니다.\n\n외부 통신, 관리자 권한, 자동 시작 등록 없음.\n종료하면 전원 유지 요청을 해제합니다.","Always Awake",MessageBoxButtons.OK,MessageBoxIcon.Information); });
+        menu.Items.Add("사용 안내",null,delegate { MessageBox.Show("Always Awake\n\n왼쪽 클릭: 켜기 / 끄기\n오른쪽 클릭: 지속시간 및 자동 실행 설정\n기본 지속시간: 종료할 때까지\n설정과 켜기/끄기 선택은 다음 실행에도 기억합니다.\n잠금 중에는 중지하고, 잠금 해제 시 이전에 켜져 있었다면 재개합니다.\n직접 꺼 두면 잠금 해제나 재부팅 후에도 꺼져 있습니다.\n\nTeams 초록색 상태 유지는 보장하지 않습니다.\nF15 단축키가 있는 앱에서는 활동 입력을 끄세요.\n외부 통신 및 관리자 권한 없음.","Always Awake",MessageBoxButtons.OK,MessageBoxIcon.Information); });
         menu.Items.Add("종료",null,delegate { ExitThread(); });
         tray.ContextMenuStrip=menu;
         tray.MouseClick += delegate(object sender,MouseEventArgs e) { if(e.Button==MouseButtons.Left) Toggle(); };
@@ -110,24 +167,46 @@ sealed class TrayApp : ApplicationContext {
         timer.Interval=1000; timer.Tick += Tick; timer.Start();
         SystemEvents.SessionSwitch += SessionChanged;
         SystemEvents.PowerModeChanged += PowerChanged;
-        RefreshStatus(); if(start) Start();
+        ready=true;
+        if(start) Start();
+        else {
+            desired=settings.Enabled;
+            deadline=minutes==0 ? long.MaxValue : clock.ElapsedMilliseconds+Math.Max(0,(settings.UntilUtc-DateTime.UtcNow.Ticks)/TimeSpan.TicksPerMillisecond);
+            TryResume(); RefreshStatus();
+        }
+    }
+    void SaveSettings() {
+        if(!ready || disposed) return;
+        settings.Enabled=desired; settings.Minutes=minutes;
+        settings.Input=inputItem.Checked; settings.Display=displayItem.Checked; settings.Resume=resumeItem.Checked;
+        settings.UntilUtc=minutes==0 || !desired ? 0 : DateTime.UtcNow.AddMilliseconds(Math.Max(0,deadline-clock.ElapsedMilliseconds)).Ticks;
+        try { settings.Save(settingsPath); }
+        catch(Exception) { if(!SelfTest) { tray.BalloonTipTitle="Always Awake"; tray.BalloonTipText="설정을 저장하지 못했습니다. 다음 실행에 반영되지 않을 수 있습니다."; tray.ShowBalloonTip(3000); } }
+    }
+    void TryResume() {
+        if(!desired || locked || suspended || active) return;
+        if(clock.ElapsedMilliseconds>=deadline) { Stop("설정한 시간이 끝났습니다."); return; }
+        if(!Native.Power(true,displayItem.Checked)) { Stop("전원 API 실패"); return; }
+        active=true; nextPulse=clock.ElapsedMilliseconds+30000; RefreshStatus();
+    }
+    void PauseForSession() {
+        if(!resumeItem.Checked) { Stop(null); return; }
+        active=false; Native.Power(false,false); RefreshStatus();
     }
     internal void Start() {
-        if(locked) return;
-        if(!Native.Power(true,displayItem.Checked)) { Stop("전원 API 실패"); return; }
-        active=true; nextPulse=clock.ElapsedMilliseconds+30000;
+        desired=true;
         deadline=minutes==0 ? long.MaxValue : clock.ElapsedMilliseconds+minutes*60000L;
-        RefreshStatus();
+        TryResume(); SaveSettings(); RefreshStatus();
     }
     internal void Stop(string reason) {
-        active=false; Native.Power(false,false); RefreshStatus();
+        desired=false; active=false; Native.Power(false,false); SaveSettings(); RefreshStatus();
         if(!SelfTest && reason!=null) { tray.BalloonTipTitle="Always Awake 중지"; tray.BalloonTipText=reason; tray.ShowBalloonTip(2500); }
     }
-    void Toggle() { if(active) Stop(null); else Start(); }
+    void Toggle() { if(desired) Stop(null); else Start(); }
     internal void Tick(object sender,EventArgs e) {
-        if(!active) return;
         long now=clock.ElapsedMilliseconds;
-        if(now>=deadline) { Stop("설정한 시간이 끝났습니다."); return; }
+        if(desired && now>=deadline) { Stop("설정한 시간이 끝났습니다."); return; }
+        if(!active) return;
         if(inputItem.Checked && now>=nextPulse) {
             nextPulse=now+30000;
             if(Native.IdleMilliseconds()>=5000) {
@@ -138,21 +217,24 @@ sealed class TrayApp : ApplicationContext {
         RefreshStatus();
     }
     void SessionChanged(object sender,SessionSwitchEventArgs e) {
+        if(disposed) return;
         if(dispatcher.InvokeRequired) { if(!disposed) dispatcher.BeginInvoke((MethodInvoker)delegate { SessionChanged(sender,e); }); return; }
-        if(e.Reason==SessionSwitchReason.SessionLock || e.Reason==SessionSwitchReason.RemoteDisconnect || e.Reason==SessionSwitchReason.ConsoleDisconnect) { locked=true; Stop("잠금 또는 세션 연결 종료"); }
-        else if(e.Reason==SessionSwitchReason.SessionUnlock || e.Reason==SessionSwitchReason.ConsoleConnect || e.Reason==SessionSwitchReason.RemoteConnect) locked=false;
+        if(e.Reason==SessionSwitchReason.SessionLock || e.Reason==SessionSwitchReason.RemoteDisconnect || e.Reason==SessionSwitchReason.ConsoleDisconnect) { locked=true; PauseForSession(); }
+        else if(e.Reason==SessionSwitchReason.SessionUnlock || e.Reason==SessionSwitchReason.ConsoleConnect || e.Reason==SessionSwitchReason.RemoteConnect) { locked=false; TryResume(); }
     }
     void PowerChanged(object sender,PowerModeChangedEventArgs e) {
+        if(disposed) return;
         if(dispatcher.InvokeRequired) { if(!disposed) dispatcher.BeginInvoke((MethodInvoker)delegate { PowerChanged(sender,e); }); return; }
-        if(e.Mode==PowerModes.Suspend) Stop("절전 진입");
+        if(e.Mode==PowerModes.Suspend) { suspended=true; PauseForSession(); }
+        else if(e.Mode==PowerModes.Resume) { suspended=false; locked=Native.SessionLocked(); TryResume(); }
     }
     void RefreshStatus() {
         string remaining=active ? (deadline==long.MaxValue ? "시간 제한 없음" : Math.Max(0,(deadline-clock.ElapsedMilliseconds+59999)/60000)+"분 남음") : "클릭하여 시작";
-        string state=active ? "켜짐" : "꺼짐";
+        string state=active ? "켜짐" : desired ? "잠시 중지" : "꺼짐";
         tray.Icon=active ? onIcon : offIcon;
         tray.Text="Always Awake · "+state+" · "+remaining;
         stateItem.Text=state+" · "+remaining;
-        toggleItem.Text=active ? "끄기" : "켜기";
+        toggleItem.Text=desired ? "끄기" : "켜기";
         for(int i=0;i<choices.Length;i++) durationItems[i].Checked=choices[i]==minutes;
     }
     internal void TestExpiration() { deadline=clock.ElapsedMilliseconds-1; Tick(null,EventArgs.Empty); }
@@ -166,7 +248,7 @@ sealed class TrayApp : ApplicationContext {
     protected override void ExitThreadCore() { Cleanup(); base.ExitThreadCore(); }
     void Cleanup() {
         if(disposed) return; disposed=true;
-        timer.Stop(); timer.Dispose(); Native.Power(false,false);
+        timer.Stop(); timer.Dispose(); active=false; Native.Power(false,false);
         SystemEvents.SessionSwitch-=SessionChanged; SystemEvents.PowerModeChanged-=PowerChanged;
         tray.Visible=false; tray.Dispose(); menu.Dispose(); dispatcher.Dispose(); onIcon.Dispose(); offIcon.Dispose();
     }
@@ -176,7 +258,8 @@ sealed class TrayApp : ApplicationContext {
 static class Program {
     [STAThread] static int Main(string[] args) {
         bool owner;
-        using(Mutex mutex=new Mutex(true,"Local\\AlwaysAwake_v1",out owner)) {
+        bool testRun=args.Length==2 && (args[0]=="--self-test" || args[0]=="--self-test-core");
+        using(Mutex mutex=new Mutex(true,"Local\\AlwaysAwake_v1"+(testRun ? "_test_"+Guid.NewGuid().ToString("N") : ""),out owner)) {
             if(!owner) { MessageBox.Show("이미 실행 중입니다. 작업 표시줄의 숨겨진 아이콘(∧)을 확인하세요.","Always Awake"); return 2; }
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
             if(args.Length==2 && (args[0]=="--self-test" || args[0]=="--self-test-core")) {
@@ -184,19 +267,21 @@ static class Program {
                 try {
                     int size=Marshal.SizeOf(typeof(Native.INPUT));
                     if(size!=(IntPtr.Size==8 ? 40 : 28)) throw new Exception("INPUT layout mismatch");
-                    using(TrayApp app=new TrayApp(false)) {
+                    string testSettings=Path.Combine(Path.GetTempPath(),"AlwaysAwake-selftest-"+Guid.NewGuid().ToString("N")+".ini");
+                    using(TrayApp app=new TrayApp(false,testSettings)) {
                         app.SelfTest=true;
                         app.Start(); if(!app.Active) throw new Exception("Power enable failed");
                         app.Stop(null); if(app.Active) throw new Exception("Pause failed");
                         app.Start(); app.TestExpiration(); if(app.Active) throw new Exception("Expiration failed");
                         app.Start(); app.TestLock(); if(app.Active) throw new Exception("Lock stop failed");
                         app.Start(); if(app.Active) throw new Exception("Started while locked");
-                        app.UnlockForTest(); if(app.Active) throw new Exception("Auto resumed after unlock");
+                        app.UnlockForTest(); if(!app.Active) throw new Exception("Unlock did not resume");
+                        app.Stop(null); app.TestLock(); app.UnlockForTest(); if(app.Active) throw new Exception("Manual pause lost");
                         app.TestTimer(); Application.Run(app);
                         if(app.Active || app.TimerPass<3) throw new Exception("Timer loop failed");
                     }
                     if(args[0]=="--self-test-core") {
-                        File.WriteAllText(args[1],"PASS: INPUT layout, tray initialization, power enable/release, pause, timed expiration, lock stop, unlock stays paused, real UI timer loop, cleanup.\r\nForeground input test not requested; no F15 input sent. Teams presence effect remains unverified.\r\n");
+                        File.WriteAllText(args[1],"PASS: INPUT layout, tray initialization, power enable/release, pause, timed expiration, lock pause, unlock resume, manual pause preserved, real UI timer loop, cleanup.\r\nForeground input test not requested; no F15 input sent. Teams presence effect remains unverified.\r\n");
                         return 0;
                     }
                     bool received=false;
